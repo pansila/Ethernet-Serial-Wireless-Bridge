@@ -1,0 +1,6 @@
+#!/bin/sh
+
+insmod ./vd_device.ko
+ifconfig vethd0 up
+ifconfig vethd0 192.168.5.1
+

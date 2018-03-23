@@ -1,0 +1,590 @@
+/*
+ * The data flow of the devices is:
+ *
+ *          vnet
+ *     _______|___________
+ *     |                  |
+ *     |                  |
+ *   vd_rec            vd_tx
+ *   (recieve)          (transmit)
+ *
+ * vnet: pseodu network device
+ * vd_rec: character device
+ * vd_tx:  character device
+ * You can modify and distribute this source code freely.
+ */
+
+#include <linux/module.h>
+#include <linux/init.h>
+
+#include <linux/mm.h>
+
+#include <linux/string.h>
+#include <linux/errno.h>
+#include <linux/types.h>
+
+#include <linux/in.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/ip.h>
+#include <linux/skbuff.h>
+#include <linux/ioctl.h>
+
+#include <asm/uaccess.h>
+
+#include "vd_device.h"
+#include "vd_ioctl.h"
+
+MODULE_LICENSE("Dual BSD/GPL");
+
+char vd_names[16];
+struct vd_device vd[2];
+struct net_device *vnet;
+struct net_device_ops vnet_device_ops;
+
+//static int timeout = VD_TIMEOUT;
+
+void vnet_rx(struct net_device *dev,int len,unsigned char *buf);
+
+void vnet_tx_timeout (struct net_device *dev);
+
+/* Initialize the vd_rec and vd_tx device,the two devices
+   are allocate the initial buffer to store the incoming and
+   outgoing data. If the TCP/IP handshake need change the
+   MTU,we must reallocte the buffer using the new MTU value.
+ */
+static int device_init(void)
+{
+    int i;
+    int err;
+    err = -ENOBUFS;
+
+    strcpy(vd[VD_RX_DEVICE].name, VD_RX_DEVICE_NAME);
+    strcpy(vd[VD_TX_DEVICE].name, VD_TX_DEVICE_NAME);
+
+    for (i = 0 ;i < 2; i++ ) {
+        vd[i].buffer_size = BUFFER_SIZE;
+        vd[i].buffer = kmalloc(vd[i].buffer_size + 4 , GFP_KERNEL);
+        vd[i].magic = VD_MAGIC;
+        vd[i].mtu = VD_MTU;
+        vd[i].busy = 0;
+        init_waitqueue_head(&vd[i].rwait);
+
+        if (vd[i].buffer == NULL)
+            goto err_exit;
+        spin_lock_init(&vd[i].lock);
+    }
+    err = 0;
+    return err;
+
+err_exit:
+    printk("There is no enongh memory for buffer allocation. \n");
+    return err;
+}
+
+static int vd_realloc(int new_mtu)
+{
+    int err = -ENOBUFS;
+    int i;
+    char *local_buffer[2];
+    int size;
+
+    for (i=0;i<2;i++){
+        local_buffer[i] = kmalloc(new_mtu + 4,GFP_KERNEL);
+        size = min(new_mtu,vd[i].buffer_size);
+
+        memcpy(local_buffer[i],vd[i].buffer,size);
+        kfree(vd[i].buffer);
+
+        vd[i].buffer = kmalloc(new_mtu + 4,GFP_KERNEL);
+        if( vd[i].buffer < 0){
+            printk("Can not realloc the buffer from kernel when change mtu.\n");
+            return err;
+        }
+
+    }
+    return 0;
+}
+/* Open the two character devices,and let the vd_device's private pointer
+ * point to the file struct */
+
+static int device_open(struct inode *inode,struct file *file)
+{
+    int Device_Major;
+    struct vd_device *vdp;
+    Device_Major = inode->i_rdev >> 8;
+
+    #ifdef _DEBUG
+    printk("Get the Device Major Number is %d\n",Device_Major);
+    #endif
+    if (Device_Major == MAJOR_NUM_RX) {
+        file->private_data = &vd[VD_RX_DEVICE];
+        vd[VD_RX_DEVICE].file = file;
+    } else if (Device_Major == MAJOR_NUM_TX) {
+        file->private_data = &vd[VD_TX_DEVICE];
+        vd[VD_TX_DEVICE].file = file;
+    } else
+        return -ENODEV;
+    vdp = (struct vd_device *)file->private_data;
+
+    if (vdp->busy != 0) {
+       printk("The device is open!\n");
+       return -EBUSY;
+    }
+
+    vdp->busy++;
+
+    return 0;
+}
+
+/* release the devices */
+int device_release(struct inode *inode, struct file *file)
+{
+    struct vd_device *vdp;
+    vdp = (struct vd_device *)file->private_data;
+    vdp->busy = 0;
+
+    return 0;
+}
+
+/* read data from vd_tx device */
+ssize_t device_read(struct file *file,char *buffer,size_t length, loff_t *offset)
+{
+    #ifdef _DEBUG
+    int i;
+    #endif
+    struct vd_device *vdp;
+    vdp = (struct vd_device *)file->private_data;
+    DECLARE_WAITQUEUE(wait,current);
+    add_wait_queue(&vdp->rwait,&wait);
+
+    for(;;){
+        set_current_state(TASK_INTERRUPTIBLE);
+        if ( file->f_flags & O_NONBLOCK)
+            break;
+        if ( vdp->tx_len > 0)
+            break;
+
+        if ( signal_pending(current))
+            break;
+        schedule();
+    }
+    set_current_state(TASK_RUNNING);
+    remove_wait_queue(&vdp->rwait,&wait);
+
+    spin_lock(&vdp->lock);
+
+    if(vdp->tx_len == 0) {
+         spin_unlock(&vdp->lock);
+         return 0;
+    } else {
+        copy_to_user(buffer,vdp->buffer,vdp->tx_len);
+        memset(vdp->buffer,0,vdp->buffer_size);
+
+        #ifdef _DEBUG
+        printk("\n read data from vd_tx \n");
+        for(i=0;i<vdp->tx_len;i++)
+            printk(" %02x",vdp->buffer[i]&0xff);
+        printk("\n");
+        #endif
+
+        length = vdp->tx_len;
+        vdp->tx_len = 0;
+    }
+    spin_unlock(&vdp->lock);
+    return length;
+}
+
+/* This function is called by vnet device to write the network data
+ * into the vd_tx character device.
+ */
+ssize_t serial_buffer_write(const char *buffer,size_t length,int buffer_size)
+{
+    if(length > buffer_size )
+        length = buffer_size;
+
+    memset(vd[VD_TX_DEVICE].buffer,0,buffer_size);
+    memcpy(vd[VD_TX_DEVICE].buffer,buffer,buffer_size);
+    vd[VD_TX_DEVICE].tx_len = length;
+    wake_up_interruptible(&vd[VD_TX_DEVICE].rwait);
+
+    return length;
+}
+
+/* Device write is called by server program, to put the user space
+ * network data into vd_rec device.
+ */
+ssize_t device_write(struct file *file,const char *buffer, size_t length,loff_t *offset)
+{
+    #ifdef _DEBUG
+    int i;
+    #endif
+    struct vd_device *vdp;
+    vdp = (struct vd_device *)file->private_data;
+
+    spin_lock(&vd[VD_RX_DEVICE].lock);
+    if(length > vdp->buffer_size)
+        length =  vdp->buffer_size;
+
+    copy_from_user( vd[VD_RX_DEVICE].buffer,buffer, length);
+    vnet_rx(vnet,length,vd[VD_RX_DEVICE].buffer);
+
+    #ifdef _DEBUG
+    printk("\nNetwork Device Recieve buffer:\n");
+    for(i =0;i< length;i++)
+       printk(" %02x",vd[VD_RX_DEVICE].buffer[i]&0xff);
+    printk("\n");
+    #endif
+    spin_unlock(&vd[VD_RX_DEVICE].lock);
+
+    return length;
+}
+
+int device_ioctl(struct inode *inode,
+                 struct file *file,
+                 unsigned int ioctl_num,
+                 unsigned long ioctl_param)
+{
+    struct vd_device *vdp;
+
+    vdp = (struct vd_device *)file->private_data;
+
+    switch(ioctl_num) {
+        case IOCTL_SET_BUSY:
+           vdp->busy = ioctl_param;
+           break;
+    }
+
+    return 0;
+}
+
+/*
+ * All the vnet_* functions are for the vnet pseudo network device vnet.
+ * vnet_open and vnet_stop are the two functions which open and release
+ * the device.
+ */
+
+int vnet_open(struct net_device *dev)
+{
+    try_module_get(THIS_MODULE);
+
+    /* Assign the hardware pseudo network hardware address,
+     * the MAC address's first octet is 00,for the MAC is
+     * used for local net,not for the Internet.
+     */
+    memcpy(dev->dev_addr, "\0ED000", ETH_ALEN);
+
+    netif_start_queue(dev);
+
+    return 0;
+}
+
+int vnet_stop(struct net_device *dev)
+{
+    netif_stop_queue(dev);
+
+    module_put(THIS_MODULE);
+
+    return 0;
+}
+
+/*
+ * vnet_rx,recieves a network packet and put the packet into TCP/IP up
+ * layer,netif_rx() is the kernel API to do such thing. The recieving
+ * procedure must alloc the sk_buff structure to store the data,
+ * and the sk_buff will be freed in the up layer.
+ */
+void vnet_rx(struct net_device *dev, int len, unsigned char *buf)
+{
+    struct sk_buff *skb;
+    struct vnet_priv *priv = (struct vnet_priv *)netdev_priv(dev);
+
+    skb = dev_alloc_skb(len+2);
+    if (!skb) {
+        printk("vnet_rx can not allocate more memory to store the packet. drop the packet\n");
+        priv->stats.rx_dropped++;
+        return;
+    }
+    skb_reserve(skb, 2);
+    memcpy(skb_put(skb, len), buf, len);
+
+    skb->dev = dev;
+    skb->protocol = eth_type_trans(skb, dev);
+    /* We need not check the checksum */
+    skb->ip_summed = CHECKSUM_UNNECESSARY;
+    priv->stats.rx_packets++;
+    priv->stats.rx_bytes += len;
+    netif_rx(skb);
+
+    return;
+}
+
+/*
+ * pseudo network hareware transmit,it just put the data into the
+ * vd_tx device.
+ */
+void vnet_hw_tx(char *buf, int len, struct net_device *dev)
+{
+    struct vnet_priv *priv = (struct vnet_priv *)netdev_priv(dev);
+
+    /* check the ip packet length,it must more then 34 octets */
+    if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
+        printk("Bad packet! It's size is less then 34!\n");
+        return;
+    }
+    /* now push the data into vd_tx device */
+    vd[VD_TX_DEVICE].buffer_write(buf,len,vd[VD_TX_DEVICE].buffer_size);
+
+    /* record the transmitted packet status */
+    priv->stats.tx_packets++;
+    priv->stats.rx_bytes += len;
+
+    /* remember to free the sk_buffer allocated in upper layer. */
+    dev_kfree_skb(priv->skb);
+}
+
+/*
+ * Transmit the packet,called by the kernel when there is an
+ * application wants to transmit a packet.
+ */
+int vnet_tx(struct sk_buff *skb, struct net_device *dev)
+{
+    int len;
+    char *data;
+    struct vnet_priv *priv = (struct vnet_priv *)netdev_priv(dev);
+
+    if (vd[VD_TX_DEVICE].busy ==1) {
+        return -EBUSY;
+    }
+
+    len = skb->len < ETH_ZLEN ? ETH_ZLEN : skb->len;
+    data = skb->data;
+    /* stamp the time stamp */
+    dev->trans_start = jiffies;
+
+    /* remember the skb and free it in vnet_hw_tx */
+    priv->skb = skb;
+
+    /* pseudo transmit the packet,hehe */
+    vnet_hw_tx(data, len, dev);
+
+    return 0;
+}
+
+/*
+ * Deal with a transmit timeout.
+ */
+void vnet_tx_timeout (struct net_device *dev)
+{
+    struct vnet_priv *priv = (struct vnet_priv *)netdev_priv(dev);
+
+    priv->stats.tx_errors++;
+    netif_wake_queue(dev);
+
+    return;
+}
+
+/*
+ * When we need some ioctls.
+ */
+int vnet_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
+{
+    return 0;
+}
+
+/*
+ * ifconfig to get the packet transmitting status.
+ */
+struct net_device_stats *vnet_stats(struct net_device *dev)
+{
+    struct vnet_priv *priv = (struct vnet_priv *)netdev_priv(dev);
+    return &priv->stats;
+}
+
+/*
+ * TCP/IP handshake will call this function, if it need.
+ */
+int vnet_change_mtu(struct net_device *dev, int new_mtu)
+{
+    int err;
+    unsigned long flags;
+    struct vnet_priv *priv = (struct vnet_priv *)netdev_priv(dev);
+    spinlock_t *lock = &priv->lock;
+
+    /* en, the mtu CANNOT LESS THEN 68 OR MORE THEN 1500. */
+    if (new_mtu < 68)
+        return -EINVAL;
+
+
+    spin_lock_irqsave(lock, flags);
+    dev->mtu = new_mtu;
+    /* realloc the new buffer */
+
+    err = vd_realloc(new_mtu);
+    spin_unlock_irqrestore(lock, flags);
+
+    return err;
+}
+
+int vnet_header(struct sk_buff *skb,
+                 struct net_device *dev,
+                 unsigned short type,
+                 void *daddr,
+                 void *saddr,
+                 unsigned int len)
+{
+    struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
+    eth->h_proto = htons(type);
+    memcpy(eth->h_source,saddr? saddr : dev->dev_addr,dev->addr_len);
+    memcpy(eth->h_dest,   daddr? daddr : dev->dev_addr, dev->addr_len);
+    return (dev->hard_header_len);
+}
+
+int vnet_rebuild_header(struct sk_buff *skb)
+{
+    struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
+
+    struct net_device *dev = skb->dev;
+
+    memcpy(eth->h_source, dev->dev_addr ,dev->addr_len);
+    memcpy(eth->h_dest,   dev->dev_addr , dev->addr_len);
+    return 0;
+
+}
+
+struct file_operations vd_ops = {
+    NULL,
+    NULL,
+    device_read,
+    device_write,
+    NULL,
+    NULL,
+    device_ioctl,
+    NULL,
+    device_open,
+    NULL,
+    device_release,
+};
+
+/* initialize the character devices */
+int vch_module_init(void)
+{
+    int err;
+    int i;
+
+    if ((err=device_init()) != 0) {
+        printk("Init device error:");
+        return err;
+    }
+
+    err = register_chrdev(MAJOR_NUM_RX,vd[VD_RX_DEVICE].name,&vd_ops);
+    if (err != 0)
+        printk("Install the buffer rec device %s fail", VD_RX_DEVICE_NAME);
+
+    for (i=0; i<2;i++)
+        vd[i].buffer_write = serial_buffer_write;
+
+    err = register_chrdev(MAJOR_NUM_TX,vd[VD_TX_DEVICE].name,&vd_ops);
+    if (err != 0)
+        printk("Install the buffer tx device %s fail",VD_TX_DEVICE_NAME);
+
+    return err;
+}
+
+/* clean up the character devices */
+void vch_module_cleanup(void)
+{
+#if 0
+    int err;
+    int i;
+
+    for (i = 0 ;i < 2; i++){
+        kfree(vd[i].buffer);
+    }
+
+    err = unregister_chrdev(MAJOR_NUM_RX, vd[VD_RX_DEVICE].name);
+    if (err != 0)
+        printk("UnInstall the buffer recieve device %s fail", VD_RX_DEVICE_NAME);
+
+    err = unregister_chrdev(MAJOR_NUM_TX, vd[VD_TX_DEVICE].name);
+    if (err != 0)
+        printk("UnInstall the buffer recieve device %s fail", VD_TX_DEVICE_NAME);
+#endif
+}
+
+static void vnet_start(struct net_device *dev)
+{
+    struct net_device_ops *device_ops = &vnet_device_ops;
+    struct vnet_priv *priv = (struct vnet_priv *)netdev_priv(dev);
+
+    ether_setup(dev);
+
+    dev->netdev_ops = device_ops;
+    dev->tx_queue_len = 500;
+    /* We do not need the ARP protocol. */
+    dev->flags |= IFF_NOARP;
+
+    device_ops->ndo_start_xmit = vnet_tx;
+    device_ops->ndo_open = vnet_open;
+    device_ops->ndo_stop = vnet_stop;
+    device_ops->ndo_get_stats = vnet_stats;
+    device_ops->ndo_change_mtu = vnet_change_mtu;
+    device_ops->ndo_tx_timeout = vnet_tx_timeout;
+    device_ops->ndo_do_ioctl = vnet_ioctl;
+
+    memset(priv, 0, sizeof(struct vnet_priv));
+    spin_lock_init(&priv->lock);
+}
+
+int vnet_module_init(void)
+{
+    int err;
+
+    vnet = alloc_netdev(sizeof(struct vnet_priv), "veth%d", vnet_start);
+    if (vnet == NULL) {
+        printk("Unable to allocate device!\n");
+        return -ENOMEM;
+    }
+
+    if ((err = register_netdev(vnet)))
+        printk("vnet: error %i registering virtual network device \"%s\"\n",
+                    err, vnet->name);
+
+    //netif_napi_add(vdev, &vv->napi, vnet_rx_poll, napi_budget());
+
+    return err;
+}
+
+void vnet_module_cleanup(void)
+{
+    kfree(netdev_priv(vnet));
+    unregister_netdev(vnet);
+
+    return;
+}
+
+/* called by the kernel to setup the module*/
+int vd_device_init(void)
+{
+    int err;
+
+    err = vch_module_init();
+    if(err < 0)
+        return err;
+
+    err = vnet_module_init();
+    if(err < 0)
+        return err;
+
+    return err;
+}
+
+/* cleanup the module */
+void vd_device_exit(void)
+{
+    vch_module_cleanup();
+    vnet_module_cleanup();
+}
+
+module_init(vd_device_init);
+module_exit(vd_device_exit);

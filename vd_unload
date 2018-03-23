@@ -1,0 +1,5 @@
+#!/bin/sh
+
+ifconfig veth0 down
+
+rmmod vd_device
