@@ -540,7 +540,7 @@ int vnet_module_init(void)
 {
     int err;
 
-    vnet = alloc_netdev(sizeof(struct vnet_priv), "veth%d", vnet_start);
+    vnet = alloc_netdev(sizeof(struct vnet_priv), "veth%d", NET_NAME_PREDICTABLE, vnet_start);
     if (vnet == NULL) {
         printk("Unable to allocate device!\n");
         return -ENOMEM;
