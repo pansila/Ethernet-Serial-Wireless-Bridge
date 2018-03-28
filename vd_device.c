@@ -191,8 +191,9 @@ ssize_t device_read(struct file *file,char *buffer,size_t length, loff_t *offset
     int i;
     #endif
     struct vd_device *vdp;
-    vdp = (struct vd_device *)file->private_data;
     DECLARE_WAITQUEUE(wait,current);
+
+    vdp = (struct vd_device *)file->private_data;
     add_wait_queue(&vdp->rwait,&wait);
 
     for(;;){
@@ -277,10 +278,14 @@ ssize_t device_write(struct file *file,const char *buffer, size_t length,loff_t 
     return length;
 }
 
-int device_ioctl(struct inode *inode,
-                 struct file *file,
-                 unsigned int ioctl_num,
-                 unsigned long ioctl_param)
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 35)
+long device_ioctl(
+#else
+int device_ioctl( struct inode *inode,
+#endif
+            struct file *file,
+            unsigned int ioctl_num,
+            unsigned long ioctl_param)
 {
     struct vd_device *vdp;
 
@@ -490,17 +495,16 @@ int vnet_rebuild_header(struct sk_buff *skb)
 }
 
 struct file_operations vd_ops = {
-    NULL,
-    NULL,
-    device_read,
-    device_write,
-    NULL,
-    NULL,
-    device_ioctl,
-    NULL,
-    device_open,
-    NULL,
-    device_release,
+    .owner = THIS_MODULE,
+    .read = device_read,
+    .write = device_write,
+#if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 35)
+    .compat_ioctl = device_ioctl,
+#else
+    .ioctl = device_ioctl,
+#endif
+    .open = device_open,
+    .release = device_release,
 };
 
 /* initialize the character devices */
