@@ -141,28 +141,22 @@ static int vd_realloc(int new_mtu)
     return 0;
 }
 
-/* Open the two character devices,and let the vd_device's private pointer
- * point to the file struct */
-static int device_open(struct inode *inode,struct file *file)
+static int device_open(struct inode *inode,struct file *filp)
 {
     int device_major;
     struct vd_device *vdp;
-    device_major = inode->i_rdev >> 8;
+
+    device_major = imajor(inode);
 
 #ifdef _DEBUG
-    printk("Get the Device Major Number is %d\n",device_major);
+    printk("Get the device major number is %d\n", device_major);
 #endif
 
-    if (device_major == vd[VD_RX_DEVICE].major) {
-        file->private_data = &vd[VD_RX_DEVICE];
-        vd[VD_RX_DEVICE].file = file;
-    } else if (device_major == vd[VD_TX_DEVICE].major) {
-        file->private_data = &vd[VD_TX_DEVICE];
-        vd[VD_TX_DEVICE].file = file;
-    } else
-        return -ENODEV;
+    vdp = container_of(inode->i_cdev, struct vd_device, vcdev);
+    filp->private_data = vdp;
 
-    vdp = (struct vd_device *)file->private_data;
+    if (device_major != vdp->major)
+        return -ENODEV;
 
     if (vdp->busy != 0) {
        printk("The device is open!\n");
@@ -174,11 +168,10 @@ static int device_open(struct inode *inode,struct file *file)
     return 0;
 }
 
-/* release the devices */
-int device_release(struct inode *inode, struct file *file)
+int device_release(struct inode *inode, struct file *filp)
 {
     struct vd_device *vdp;
-    vdp = (struct vd_device *)file->private_data;
+    vdp = (struct vd_device *)filp->private_data;
     vdp->busy = 0;
 
     return 0;
@@ -196,14 +189,14 @@ ssize_t device_read(struct file *file,char *buffer,size_t length, loff_t *offset
     vdp = (struct vd_device *)file->private_data;
     add_wait_queue(&vdp->rwait,&wait);
 
-    for(;;){
+    while(true) {
         set_current_state(TASK_INTERRUPTIBLE);
-        if ( file->f_flags & O_NONBLOCK)
+        if (file->f_flags & O_NONBLOCK)
             break;
-        if ( vdp->tx_len > 0)
+        if (vdp->tx_len > 0)
             break;
 
-        if ( signal_pending(current))
+        if (signal_pending(current))
             break;
         schedule();
     }
