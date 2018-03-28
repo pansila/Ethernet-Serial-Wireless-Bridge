@@ -5,17 +5,18 @@
  *     _______|___________
  *     |                  |
  *     |                  |
- *   vd_rec            vd_tx
+ *   vd_rx            vd_tx
  *   (recieve)          (transmit)
  *
  * vnet: pseodu network device
- * vd_rec: character device
+ * vd_rx: character device
  * vd_tx:  character device
  * You can modify and distribute this source code freely.
  */
 
 #include <linux/module.h>
 #include <linux/init.h>
+#include <linux/version.h>
 
 #include <linux/mm.h>
 
@@ -26,6 +27,7 @@
 #include <linux/in.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/cdev.h>
 #include <linux/ip.h>
 #include <linux/skbuff.h>
 #include <linux/ioctl.h>
@@ -48,37 +50,70 @@ void vnet_rx(struct net_device *dev,int len,unsigned char *buf);
 
 void vnet_tx_timeout (struct net_device *dev);
 
-/* Initialize the vd_rec and vd_tx device,the two devices
+
+static int vcdev_devno_init(struct vd_device *dev, int major, int minor, char *name)
+{
+    int devno;
+    int err;
+
+    if (major) {
+        devno = MKDEV(major, minor);
+        err = register_chrdev_region(devno, 1, name);
+    } else {
+        err = alloc_chrdev_region(&devno, minor, 1, name);
+        dev->major = MAJOR(devno);
+    }
+
+    if (err < 0) {
+        printk(KERN_WARNING "vcdev: can't get major %d\n", dev->major);
+        return err;
+    }
+
+    return 0;
+}
+
+/* Initialize the vd_rx and vd_tx device,the two devices
    are allocate the initial buffer to store the incoming and
    outgoing data. If the TCP/IP handshake need change the
    MTU,we must reallocte the buffer using the new MTU value.
  */
-static int device_init(void)
+static int vcdev_init(void)
 {
     int i;
-    int err;
-    err = -ENOBUFS;
+    int err = 0;
+    struct vd_device *vdev;
+
+    memset(vd, 0, sizeof(vd));
 
     strcpy(vd[VD_RX_DEVICE].name, VD_RX_DEVICE_NAME);
     strcpy(vd[VD_TX_DEVICE].name, VD_TX_DEVICE_NAME);
 
-    for (i = 0 ;i < 2; i++ ) {
-        vd[i].buffer_size = BUFFER_SIZE;
-        vd[i].buffer = kmalloc(vd[i].buffer_size + 4 , GFP_KERNEL);
-        vd[i].magic = VD_MAGIC;
-        vd[i].mtu = VD_MTU;
-        vd[i].busy = 0;
-        init_waitqueue_head(&vd[i].rwait);
-
-        if (vd[i].buffer == NULL)
+    for (i = 0; i < 2; i++) {
+        vdev = &vd[i];
+        err = vcdev_devno_init(vdev, 0, i, vdev->name);
+        if (err)
             goto err_exit;
-        spin_lock_init(&vd[i].lock);
     }
-    err = 0;
-    return err;
+
+    for (i = 0 ;i < 2; i++ ) {
+        vdev = &vd[i];
+        vdev->buffer_size = BUFFER_SIZE;
+        vdev->buffer = kmalloc(vdev->buffer_size + 4 , GFP_KERNEL);
+        vdev->magic = VD_MAGIC;
+        vdev->mtu = VD_MTU;
+        vdev->busy = 0;
+        init_waitqueue_head(&vdev->rwait);
+
+        if (vdev->buffer == NULL) {
+            err = -ENOBUFS;
+            printk("There is no enongh memory for buffer allocation. \n");
+            goto err_exit;
+        }
+        spin_lock_init(&vdev->lock);
+    }
+    return 0;
 
 err_exit:
-    printk("There is no enongh memory for buffer allocation. \n");
     return err;
 }
 
@@ -105,26 +140,28 @@ static int vd_realloc(int new_mtu)
     }
     return 0;
 }
+
 /* Open the two character devices,and let the vd_device's private pointer
  * point to the file struct */
-
 static int device_open(struct inode *inode,struct file *file)
 {
-    int Device_Major;
+    int device_major;
     struct vd_device *vdp;
-    Device_Major = inode->i_rdev >> 8;
+    device_major = inode->i_rdev >> 8;
 
-    #ifdef _DEBUG
-    printk("Get the Device Major Number is %d\n",Device_Major);
-    #endif
-    if (Device_Major == MAJOR_NUM_RX) {
+#ifdef _DEBUG
+    printk("Get the Device Major Number is %d\n",device_major);
+#endif
+
+    if (device_major == vd[VD_RX_DEVICE].major) {
         file->private_data = &vd[VD_RX_DEVICE];
         vd[VD_RX_DEVICE].file = file;
-    } else if (Device_Major == MAJOR_NUM_TX) {
+    } else if (device_major == vd[VD_TX_DEVICE].major) {
         file->private_data = &vd[VD_TX_DEVICE];
         vd[VD_TX_DEVICE].file = file;
     } else
         return -ENODEV;
+
     vdp = (struct vd_device *)file->private_data;
 
     if (vdp->busy != 0) {
@@ -212,7 +249,7 @@ ssize_t serial_buffer_write(const char *buffer,size_t length,int buffer_size)
 }
 
 /* Device write is called by server program, to put the user space
- * network data into vd_rec device.
+ * network data into vd_rx device.
  */
 ssize_t device_write(struct file *file,const char *buffer, size_t length,loff_t *offset)
 {
@@ -471,45 +508,54 @@ int vch_module_init(void)
 {
     int err;
     int i;
+    int devno;
+    struct vd_device *vdev;
 
-    if ((err=device_init()) != 0) {
-        printk("Init device error:");
-        return err;
+    err = vcdev_init();
+    if (err != 0) {
+        printk("Initialize char device error: %d\n", err);
+        goto err_exit;
     }
 
-    err = register_chrdev(MAJOR_NUM_RX,vd[VD_RX_DEVICE].name,&vd_ops);
-    if (err != 0)
-        printk("Install the buffer rec device %s fail", VD_RX_DEVICE_NAME);
+    for (i = 0; i < 2; i++) {
+        vdev = &vd[i];
+        devno = MKDEV(vdev->major, i);
+        vdev = &vd[i];
+        cdev_init(&vdev->vcdev, &vd_ops);
+        vdev->vcdev.owner = THIS_MODULE;
+        vdev->vcdev.ops = &vd_ops;
+        err = cdev_add(&vdev->vcdev, devno, 1);
+        if (err != 0) {
+            printk("Install the buffer rx device %s fail(%d)\n", VD_RX_DEVICE_NAME, err);
+            goto err_exit;
+        }
+    }
 
-    for (i=0; i<2;i++)
+    for (i = 0; i < 2; i++)
         vd[i].buffer_write = serial_buffer_write;
 
-    err = register_chrdev(MAJOR_NUM_TX,vd[VD_TX_DEVICE].name,&vd_ops);
-    if (err != 0)
-        printk("Install the buffer tx device %s fail",VD_TX_DEVICE_NAME);
+    return 0;
 
+err_exit:
+    // TODO: cdev_del??
     return err;
 }
 
 /* clean up the character devices */
 void vch_module_cleanup(void)
 {
-#if 0
-    int err;
+    int devno;
     int i;
+    struct vd_device* vdev;
 
     for (i = 0 ;i < 2; i++){
-        kfree(vd[i].buffer);
+        vdev = &vd[i];
+        kfree(vdev->buffer);
+
+        devno = MKDEV(vdev->major, i);
+        unregister_chrdev_region(devno, 1);
+        cdev_del(&vdev->vcdev);
     }
-
-    err = unregister_chrdev(MAJOR_NUM_RX, vd[VD_RX_DEVICE].name);
-    if (err != 0)
-        printk("UnInstall the buffer recieve device %s fail", VD_RX_DEVICE_NAME);
-
-    err = unregister_chrdev(MAJOR_NUM_TX, vd[VD_TX_DEVICE].name);
-    if (err != 0)
-        printk("UnInstall the buffer recieve device %s fail", VD_TX_DEVICE_NAME);
-#endif
 }
 
 static void vnet_start(struct net_device *dev)
@@ -540,7 +586,11 @@ int vnet_module_init(void)
 {
     int err;
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 16, 56) // starting 3.17
     vnet = alloc_netdev(sizeof(struct vnet_priv), "veth%d", NET_NAME_PREDICTABLE, vnet_start);
+#else
+    vnet = alloc_netdev(sizeof(struct vnet_priv), "veth%d", vnet_start);
+#endif
     if (vnet == NULL) {
         printk("Unable to allocate device!\n");
         return -ENOMEM;

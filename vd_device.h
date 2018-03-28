@@ -31,7 +31,10 @@ struct vd_device{
 	int tx_len;
     int rx_len;
     int buffer_size;
+    int major;
+    int minor;
 
+    struct cdev vcdev;
 	struct file *file;
     ssize_t (*buffer_write)(const char *buffer,size_t length,int buffer_size);
 };
