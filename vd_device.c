@@ -612,8 +612,9 @@ int vnet_module_init(void)
 
 void vnet_module_cleanup(void)
 {
-    kfree(netdev_priv(vnet));
     unregister_netdev(vnet);
+    kfree(netdev_priv(vnet));
+    free_netdev(vnet);
 
     return;
 }
