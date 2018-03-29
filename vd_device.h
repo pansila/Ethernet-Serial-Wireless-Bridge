@@ -24,9 +24,8 @@ struct vd_device{
 	int busy;
 	unsigned char *buffer;
 
-    wait_queue_head_t rwait;
 	int mtu;
-	spinlock_t lock;
+    struct semaphore sem;
 
 	int tx_len;
     int rx_len;

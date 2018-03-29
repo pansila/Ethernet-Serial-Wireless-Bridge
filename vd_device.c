@@ -18,8 +18,8 @@
 #include <linux/init.h>
 #include <linux/version.h>
 
+#include <linux/fs.h>
 #include <linux/mm.h>
-
 #include <linux/string.h>
 #include <linux/errno.h>
 #include <linux/types.h>
@@ -31,12 +31,14 @@
 #include <linux/ip.h>
 #include <linux/skbuff.h>
 #include <linux/ioctl.h>
+#include <linux/semaphore.h>
 
 #include <asm/uaccess.h>
 
 #include "vd_device.h"
 #include "vd_ioctl.h"
 
+MODULE_AUTHOR("Lynx Zhou");
 MODULE_LICENSE("Dual BSD/GPL");
 
 char vd_names[16];
@@ -72,10 +74,26 @@ static int vcdev_devno_init(struct vd_device *dev, int major, int minor, char *n
     return 0;
 }
 
+static void vcdev_release(void)
+{
+    int devno;
+    int i;
+    struct vd_device* vdev;
+
+    for (i = 0 ;i < 2; i++){
+        vdev = &vd[i];
+        kfree(vdev->buffer);
+
+        devno = MKDEV(vdev->major, i);
+        unregister_chrdev_region(devno, 1);
+        cdev_del(&vdev->vcdev);
+    }
+}
+
 /* Initialize the vd_rx and vd_tx device,the two devices
-   are allocate the initial buffer to store the incoming and
-   outgoing data. If the TCP/IP handshake need change the
-   MTU,we must reallocte the buffer using the new MTU value.
+ * are allocate the initial buffer to store the incoming and
+ * outgoing data. If the TCP/IP handshake need change the
+ * MTU,we must reallocte the buffer using the new MTU value.
  */
 static int vcdev_init(void)
 {
@@ -102,18 +120,23 @@ static int vcdev_init(void)
         vdev->magic = VD_MAGIC;
         vdev->mtu = VD_MTU;
         vdev->busy = 0;
-        init_waitqueue_head(&vdev->rwait);
 
         if (vdev->buffer == NULL) {
             err = -ENOBUFS;
             printk("There is no enongh memory for buffer allocation. \n");
             goto err_exit;
         }
-        spin_lock_init(&vdev->lock);
+
+        if (VD_TX_DEVICE == i)
+            sema_init(&vdev->sem, 0);
+        else
+            sema_init(&vdev->sem, 1);
     }
+
     return 0;
 
 err_exit:
+    vcdev_release();
     return err;
 }
 
@@ -124,24 +147,25 @@ static int vd_realloc(int new_mtu)
     char *local_buffer[2];
     int size;
 
-    for (i=0;i<2;i++){
-        local_buffer[i] = kmalloc(new_mtu + 4,GFP_KERNEL);
-        size = min(new_mtu,vd[i].buffer_size);
+    for (i = 0; i < 2; i++){
+        local_buffer[i] = kmalloc(new_mtu + 4, GFP_KERNEL);
+        size = min(new_mtu, vd[i].buffer_size);
 
-        memcpy(local_buffer[i],vd[i].buffer,size);
+        memcpy(local_buffer[i], vd[i].buffer, size);
         kfree(vd[i].buffer);
 
-        vd[i].buffer = kmalloc(new_mtu + 4,GFP_KERNEL);
-        if( vd[i].buffer < 0){
+        vd[i].buffer = kmalloc(new_mtu + 4, GFP_KERNEL);
+        if(vd[i].buffer < 0){
             printk("Can not realloc the buffer from kernel when change mtu.\n");
             return err;
         }
 
     }
+
     return 0;
 }
 
-static int device_open(struct inode *inode,struct file *filp)
+static int device_open(struct inode *inode, struct file *filp)
 {
     int device_major;
     struct vd_device *vdp;
@@ -171,6 +195,7 @@ static int device_open(struct inode *inode,struct file *filp)
 int device_release(struct inode *inode, struct file *filp)
 {
     struct vd_device *vdp;
+
     vdp = (struct vd_device *)filp->private_data;
     vdp->busy = 0;
 
@@ -178,66 +203,57 @@ int device_release(struct inode *inode, struct file *filp)
 }
 
 /* read data from vd_tx device */
-ssize_t device_read(struct file *file,char *buffer,size_t length, loff_t *offset)
+ssize_t device_read(struct file *filp, char *buffer, size_t length, loff_t *offset)
 {
     #ifdef _DEBUG
     int i;
     #endif
     struct vd_device *vdp;
-    DECLARE_WAITQUEUE(wait,current);
 
-    vdp = (struct vd_device *)file->private_data;
-    add_wait_queue(&vdp->rwait,&wait);
+    vdp = (struct vd_device *)filp->private_data;
 
-    while(true) {
-        set_current_state(TASK_INTERRUPTIBLE);
-        if (file->f_flags & O_NONBLOCK)
-            break;
-        if (vdp->tx_len > 0)
-            break;
-
-        if (signal_pending(current))
-            break;
-        schedule();
+    if ((filp->f_flags & O_NONBLOCK)) {
+        if (down_trylock(&vdp->sem)) {
+            return -EAGAIN;
+        }
+    } else if (down_interruptible(&vdp->sem)) {
+        return -ERESTARTSYS;
     }
-    set_current_state(TASK_RUNNING);
-    remove_wait_queue(&vdp->rwait,&wait);
 
-    spin_lock(&vdp->lock);
-
-    if(vdp->tx_len == 0) {
-         spin_unlock(&vdp->lock);
-         return 0;
-    } else {
-        copy_to_user(buffer,vdp->buffer,vdp->tx_len);
-        memset(vdp->buffer,0,vdp->buffer_size);
-
-        #ifdef _DEBUG
-        printk("\n read data from vd_tx \n");
-        for(i=0;i<vdp->tx_len;i++)
-            printk(" %02x",vdp->buffer[i]&0xff);
-        printk("\n");
-        #endif
-
-        length = vdp->tx_len;
-        vdp->tx_len = 0;
+    if (vdp->tx_len == 0) {
+        return -EAGAIN;
     }
-    spin_unlock(&vdp->lock);
+
+    #ifdef _DEBUG
+    printk("\n read data from vd_tx \n");
+    for (i = 0; i < vdp->tx_len; i++)
+        printk(" %02x", vdp->buffer[i] & 0xff);
+    printk("\n");
+    #endif
+
+    if (copy_to_user(buffer, vdp->buffer, vdp->tx_len)) {
+        return -EFAULT;
+    }
+
+    memset(vdp->buffer, 0, vdp->buffer_size); // TODO: really needed?
+    length = vdp->tx_len;  // TODO:
+    vdp->tx_len = 0;
+
     return length;
 }
 
-/* This function is called by vnet device to write the network data
- * into the vd_tx character device.
- */
-ssize_t serial_buffer_write(const char *buffer,size_t length,int buffer_size)
+ssize_t serial_buffer_write(const char *buffer, size_t length, int buffer_size)
 {
-    if(length > buffer_size )
+    struct vd_device *vdp = &vd[VD_TX_DEVICE];
+
+    if (length > buffer_size)
         length = buffer_size;
 
-    memset(vd[VD_TX_DEVICE].buffer,0,buffer_size);
-    memcpy(vd[VD_TX_DEVICE].buffer,buffer,buffer_size);
-    vd[VD_TX_DEVICE].tx_len = length;
-    wake_up_interruptible(&vd[VD_TX_DEVICE].rwait);
+    memset(vdp->buffer, 0, buffer_size);
+    memcpy(vdp->buffer, buffer, buffer_size);
+    vdp->tx_len = length;
+
+    up(&vdp->sem);
 
     return length;
 }
@@ -245,28 +261,32 @@ ssize_t serial_buffer_write(const char *buffer,size_t length,int buffer_size)
 /* Device write is called by server program, to put the user space
  * network data into vd_rx device.
  */
-ssize_t device_write(struct file *file,const char *buffer, size_t length,loff_t *offset)
+ssize_t device_write(struct file *filp, const char *buffer, size_t length, loff_t *offset)
 {
     #ifdef _DEBUG
     int i;
     #endif
     struct vd_device *vdp;
-    vdp = (struct vd_device *)file->private_data;
+    vdp = (struct vd_device *)filp->private_data;
 
-    spin_lock(&vd[VD_RX_DEVICE].lock);
-    if(length > vdp->buffer_size)
-        length =  vdp->buffer_size;
+    //spin_lock(&vd[VD_RX_DEVICE].lock);
+    if (down_interruptible(&vdp->sem))
+        return -ERESTARTSYS;
 
-    copy_from_user( vd[VD_RX_DEVICE].buffer,buffer, length);
-    vnet_rx(vnet,length,vd[VD_RX_DEVICE].buffer);
+    if (length > vdp->buffer_size)
+        length = vdp->buffer_size;
+
+    copy_from_user(vd[VD_RX_DEVICE].buffer, buffer, length);
+    vnet_rx(vnet, length, vd[VD_RX_DEVICE].buffer);
 
     #ifdef _DEBUG
     printk("\nNetwork Device Recieve buffer:\n");
-    for(i =0;i< length;i++)
-       printk(" %02x",vd[VD_RX_DEVICE].buffer[i]&0xff);
+    for (i = 0; i < length; i++)
+       printk(" %02x", vd[VD_RX_DEVICE].buffer[i] & 0xff);
     printk("\n");
     #endif
-    spin_unlock(&vd[VD_RX_DEVICE].lock);
+    //spin_unlock(&vd[VD_RX_DEVICE].lock);
+    up(&vdp->sem);
 
     return length;
 }
@@ -274,15 +294,15 @@ ssize_t device_write(struct file *file,const char *buffer, size_t length,loff_t 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 35)
 long device_ioctl(
 #else
-int device_ioctl( struct inode *inode,
+int device_ioctl(struct inode *inode,
 #endif
-            struct file *file,
+            struct file *filp,
             unsigned int ioctl_num,
             unsigned long ioctl_param)
 {
     struct vd_device *vdp;
 
-    vdp = (struct vd_device *)file->private_data;
+    vdp = (struct vd_device *)filp->private_data;
 
     switch(ioctl_num) {
         case IOCTL_SET_BUSY:
@@ -298,7 +318,6 @@ int device_ioctl( struct inode *inode,
  * vnet_open and vnet_stop are the two functions which open and release
  * the device.
  */
-
 int vnet_open(struct net_device *dev)
 {
     try_module_get(THIS_MODULE);
@@ -469,22 +488,23 @@ int vnet_header(struct sk_buff *skb,
                  unsigned int len)
 {
     struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
+
     eth->h_proto = htons(type);
     memcpy(eth->h_source,saddr? saddr : dev->dev_addr,dev->addr_len);
     memcpy(eth->h_dest,   daddr? daddr : dev->dev_addr, dev->addr_len);
+
     return (dev->hard_header_len);
 }
 
 int vnet_rebuild_header(struct sk_buff *skb)
 {
     struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
-
     struct net_device *dev = skb->dev;
 
     memcpy(eth->h_source, dev->dev_addr ,dev->addr_len);
     memcpy(eth->h_dest,   dev->dev_addr , dev->addr_len);
-    return 0;
 
+    return 0;
 }
 
 struct file_operations vd_ops = {
@@ -517,7 +537,6 @@ int vch_module_init(void)
     for (i = 0; i < 2; i++) {
         vdev = &vd[i];
         devno = MKDEV(vdev->major, i);
-        vdev = &vd[i];
         cdev_init(&vdev->vcdev, &vd_ops);
         vdev->vcdev.owner = THIS_MODULE;
         vdev->vcdev.ops = &vd_ops;
@@ -541,18 +560,7 @@ err_exit:
 /* clean up the character devices */
 void vch_module_cleanup(void)
 {
-    int devno;
-    int i;
-    struct vd_device* vdev;
-
-    for (i = 0 ;i < 2; i++){
-        vdev = &vd[i];
-        kfree(vdev->buffer);
-
-        devno = MKDEV(vdev->major, i);
-        unregister_chrdev_region(devno, 1);
-        cdev_del(&vdev->vcdev);
-    }
+    vcdev_release();
 }
 
 static void vnet_start(struct net_device *dev)
