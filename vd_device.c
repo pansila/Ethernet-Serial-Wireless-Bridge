@@ -84,7 +84,7 @@ static void vcdev_release(void)
         vdev = &vd[i];
         kfree(vdev->buffer);
 
-        devno = MKDEV(vdev->major, i);
+        devno = MKDEV(vdev->major, vdev->minor);
         unregister_chrdev_region(devno, 1);
         cdev_del(&vdev->vcdev);
     }
@@ -108,7 +108,8 @@ static int vcdev_init(void)
 
     for (i = 0; i < 2; i++) {
         vdev = &vd[i];
-        err = vcdev_devno_init(vdev, 0, i, vdev->name);
+        // auto make one by leaving major as zero
+        err = vcdev_devno_init(vdev, vdev->major, vdev->minor, vdev->name);
         if (err)
             goto err_exit;
     }
@@ -359,6 +360,7 @@ void vnet_rx(struct net_device *dev, int len, unsigned char *buf)
         priv->stats.rx_dropped++;
         return;
     }
+
     skb_reserve(skb, 2);
     memcpy(skb_put(skb, len), buf, len);
 
@@ -366,8 +368,10 @@ void vnet_rx(struct net_device *dev, int len, unsigned char *buf)
     skb->protocol = eth_type_trans(skb, dev);
     /* We need not check the checksum */
     skb->ip_summed = CHECKSUM_UNNECESSARY;
+
     priv->stats.rx_packets++;
     priv->stats.rx_bytes += len;
+
     netif_rx(skb);
 
     return;
@@ -387,11 +391,11 @@ void vnet_hw_tx(char *buf, int len, struct net_device *dev)
         return;
     }
     /* now push the data into vd_tx device */
-    vd[VD_TX_DEVICE].buffer_write(buf,len,vd[VD_TX_DEVICE].buffer_size);
+    vd[VD_TX_DEVICE].buffer_write(buf, len, vd[VD_TX_DEVICE].buffer_size);
 
     /* record the transmitted packet status */
     priv->stats.tx_packets++;
-    priv->stats.rx_bytes += len;
+    priv->stats.tx_bytes += len;
 
     /* remember to free the sk_buffer allocated in upper layer. */
     dev_kfree_skb(priv->skb);
@@ -419,7 +423,7 @@ int vnet_tx(struct sk_buff *skb, struct net_device *dev)
     /* remember the skb and free it in vnet_hw_tx */
     priv->skb = skb;
 
-    /* pseudo transmit the packet,hehe */
+    /* pseudo transmit the packet */
     vnet_hw_tx(data, len, dev);
 
     return 0;
@@ -446,12 +450,10 @@ int vnet_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
     return 0;
 }
 
-/*
- * ifconfig to get the packet transmitting status.
- */
 struct net_device_stats *vnet_stats(struct net_device *dev)
 {
     struct vnet_priv *priv = (struct vnet_priv *)netdev_priv(dev);
+
     return &priv->stats;
 }
 
@@ -487,22 +489,22 @@ int vnet_header(struct sk_buff *skb,
                  void *saddr,
                  unsigned int len)
 {
-    struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
+    struct ethhdr *eth = (struct ethhdr *)skb_push(skb, ETH_HLEN);
 
     eth->h_proto = htons(type);
-    memcpy(eth->h_source,saddr? saddr : dev->dev_addr,dev->addr_len);
-    memcpy(eth->h_dest,   daddr? daddr : dev->dev_addr, dev->addr_len);
+    memcpy(eth->h_source, saddr ? saddr : dev->dev_addr, dev->addr_len);
+    memcpy(eth->h_dest,   daddr ? daddr : dev->dev_addr, dev->addr_len);
 
-    return (dev->hard_header_len);
+    return dev->hard_header_len;
 }
 
 int vnet_rebuild_header(struct sk_buff *skb)
 {
-    struct ethhdr *eth = (struct ethhdr *)skb_push(skb,ETH_HLEN);
+    struct ethhdr *eth = (struct ethhdr *)skb_push(skb, ETH_HLEN);
     struct net_device *dev = skb->dev;
 
-    memcpy(eth->h_source, dev->dev_addr ,dev->addr_len);
-    memcpy(eth->h_dest,   dev->dev_addr , dev->addr_len);
+    memcpy(eth->h_source, dev->dev_addr, dev->addr_len);
+    memcpy(eth->h_dest,   dev->dev_addr, dev->addr_len);
 
     return 0;
 }
@@ -536,7 +538,7 @@ int vch_module_init(void)
 
     for (i = 0; i < 2; i++) {
         vdev = &vd[i];
-        devno = MKDEV(vdev->major, i);
+        devno = MKDEV(vdev->major, vdev->minor);
         cdev_init(&vdev->vcdev, &vd_ops);
         vdev->vcdev.owner = THIS_MODULE;
         vdev->vcdev.ops = &vd_ops;
