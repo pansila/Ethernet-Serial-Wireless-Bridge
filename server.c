@@ -16,7 +16,9 @@
 #include <termios.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
-#include "ed_ioctl.h"
+#include "vd_ioctl.h"
+#include "server.h"
+
 #define BUFFER_SIZE 2048
 
 /* These defination is from SLIP protocol. */
@@ -25,14 +27,13 @@
 #define ESC_END         0334
 #define ESC_ESC         0335
 
-/* open the ttyS0 serial port */
-int open_port(void)
+int open_com(void)
 {
     int fd;
 
     fd = open("/dev/ttyUSB0", O_RDWR | O_NOCTTY | O_NDELAY );
     if (fd == -1) {
-        perror("open_port: Unable to open /dev/ttyS0 - ");
+        perror("open_com: Unable to open /dev/ttyUSB0 - ");
         return -1;
     }
 
@@ -47,10 +48,10 @@ int setup_com(int fd)
     struct termios options;
     tcgetattr(fd, &options);
     /*
-     * Set the baud rates to 19200...
+     * Set the baud rates to 115200...
      */
-    cfsetispeed(&options, B38400);
-    cfsetospeed(&options, B38400);
+    cfsetispeed(&options, B115200);
+    cfsetospeed(&options, B115200);
 
     /*
      * Enable the receiver and set local mode...
@@ -81,6 +82,7 @@ int setup_com(int fd)
     options.c_cc[VTIME] = 10;
 
     tcsetattr(fd, TCSANOW, &options);
+
     return 1;
 }
 
@@ -89,7 +91,7 @@ int open_dev(char *file_name)
     int fd;
     fd = open(file_name ,O_RDWR);
     if(fd < 0) {
-        perror("Open ed_rec device error:");
+        perror("Open vc_rx device error:");
         return -1;
     }
 
@@ -179,38 +181,39 @@ int frame_unpack(unsigned char *src, unsigned char *des)
 int main(int argc ,char *argv[])
 {
     int fd;
-    int fd_rec;
+    int fd_rx;
     int fd_tx;
 
-    unsigned char buffer_rec[BUFFER_SIZE];
+    unsigned char buffer_rx[BUFFER_SIZE];
     unsigned char buffer_tx[BUFFER_SIZE];
     unsigned char buffer_tx_pack[BUFFER_SIZE];
 
     unsigned char buffer[BUFFER_SIZE];
     unsigned char *buffer_ptr;
-    unsigned char *rec_ptr;
+    unsigned char *rx_ptr;
     unsigned char *tx_ptr;
     int flag;
     int  nbytes;
     pid_t pid;
     int tx_length;
-    int rec_length;
+    int rx_length;
     int i;
-    rec_ptr = buffer_rec;
-    tx_ptr = buffer_tx;
-    buffer_ptr = buffer;
-    int rec_count;
+    int rx_count;
     int tx_count;
 
+    rx_ptr = buffer_rx;
+    tx_ptr = buffer_tx;
+    buffer_ptr = buffer;
 
-    fd_rec = open_dev("/dev/ed_rec");
-    fd_tx = open_dev("/dev/ed_tx");
+    fd_rx = open_dev("/dev/vc_rx");
+    fd_tx = open_dev("/dev/vc_tx");
 
-    if(fd_rec <0 || fd_tx <0) {
+    if(fd_rx <0 || fd_tx <0) {
         close(fd);
         return 0;
     }
-    fd = open_port();
+
+    fd = open_com();
     if(fd < 0)
         return 0;
 
@@ -220,54 +223,54 @@ int main(int argc ,char *argv[])
     if(pid < 0) {
         printf("Can not creat the process\n");
         close(fd);
-        close(fd_rec);
+        close(fd_rx);
         close(fd_tx);
         return 0;
     }
-    if(pid ==0) {
+    if(pid == 0) {
         /* read process */
-        for (;;) {
-            /* read data from /dev/ttyS0, and write the data into buffer_rec,wait for the
+        while (1) {
+            /* read data from /dev/ttyS0, and write the data into buffer_rx,wait for the
                kernel to get the data.
                */
             flag = 0;
-            rec_count = 0;
+            rx_count = 0;
             buffer_ptr = buffer;
 
-            while ((nbytes = read(fd, rec_ptr, BUFFER_SIZE-1)) > 0) {
-                rec_length = 0;
-                for(i=0;i< nbytes;i++) {
-                    rec_count += 1;
-                    rec_length = rec_length +1;
-                    if((buffer_rec[i])== END) {
+            while ((nbytes = read(fd, rx_ptr, BUFFER_SIZE-1)) > 0) {
+                rx_length = 0;
+                for(i = 0; i < nbytes; i++) {
+                    rx_count++;
+                    rx_length++;
+                    if((buffer_rx[i]) == END) {
                         flag = flag +1;
-                        if(flag ==2)
+                        if(flag == 2)
                             break;
                     }
                 }
 
 
-                if(rec_count < BUFFER_SIZE) {
-                    memcpy(buffer_ptr,rec_ptr,rec_length);
+                if(rx_count < BUFFER_SIZE) {
+                    memcpy(buffer_ptr,rx_ptr,rx_length);
 
-                    buffer_ptr += rec_length;
-                    rec_length = 0;
+                    buffer_ptr += rx_length;
+                    rx_length = 0;
                 }
                 /* we recieve two ENDs */
                 if(flag == 2) {
                     flag = 0;
                     buffer_ptr = buffer;
-                    memset(buffer_rec,0,sizeof(buffer_rec));
-                    rec_ptr = buffer_rec;
-                    rec_count =frame_unpack(buffer_ptr,rec_ptr);
+                    memset(buffer_rx,0,sizeof(buffer_rx));
+                    rx_ptr = buffer_rx;
+                    rx_count =frame_unpack(buffer_ptr,rx_ptr);
 
 #ifdef _DEBUG
                     printf("\n Service recieve :\n");
-                    for(i=0;i<rec_count;i++)
-                        printf(" %02x",rec_ptr[i]&0xff);
+                    for(i=0;i<rx_count;i++)
+                        printf(" %02x",rx_ptr[i]&0xff);
                     printf("\n");
 #endif
-                    write(fd_rec,rec_ptr,rec_count);
+                    write(fd_rx,rx_ptr,rx_count);
                 }
             }
         }
@@ -275,7 +278,7 @@ int main(int argc ,char *argv[])
         int length;
         /* write process */
         for (;;) {
-            /* read data from /dev/ttyS0, and write the data into buffer_rec,wait for the
+            /* read data from /dev/ttyS0, and write the data into buffer_rx,wait for the
                kernel to get the data.
                */
             tx_ptr = buffer_tx;
@@ -304,7 +307,7 @@ int main(int argc ,char *argv[])
     }
 
     close(fd);
-    close(fd_rec);
+    close(fd_rx);
     close(fd_tx);
 
     return (-1);

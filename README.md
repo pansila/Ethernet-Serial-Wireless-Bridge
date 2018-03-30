@@ -10,6 +10,7 @@
 
    ```bash
    # make
+   # make server
    ```
 
 2. Apply the execution permission to vd_load and vd_unload:
@@ -31,7 +32,7 @@
 3. run server
 
    ```bash
-   #./server
+   # ./server
    ```
 
    now you can use the veth0 device and send and receive data through it.:)
